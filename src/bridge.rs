@@ -29,11 +29,15 @@ pub fn run(key: &str) -> i32 {
     };
     let mut input = Vec::new();
     let _ = io::stdin().take(MAX_INPUT).read_to_end(&mut input);
-    let data = serde_json::from_slice(&input)
+    let mut data = serde_json::from_slice(&input)
         .ok()
         .and_then(|payload| services::extract(service, &payload));
-    if let (Some(data), Some(path)) = (&data, received_path(service)) {
-        let _ = store(&path, data, Local::now().timestamp());
+    if let Some(path) = received_path(service) {
+        if let Some(data) = data.as_mut() {
+            let _ = store(service, &path, data, Local::now().timestamp());
+        } else if service == ServiceId::ClaudeCode {
+            data = read(&path).map(|(_, data)| data);
+        }
     }
     // Keep the user's own status line visible; without one, show what is left.
     let previous = Settings::load()
@@ -64,7 +68,7 @@ pub fn received_path(service: ServiceId) -> Option<PathBuf> {
     )
 }
 
-/// The usage numbers a tool reported last, with the Unix time they arrived.
+/// Last known usage numbers, with the Unix time of the last usable update.
 pub fn read(path: &Path) -> Option<(i64, Value)> {
     let value: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
     Some((
@@ -73,9 +77,19 @@ pub fn read(path: &Path) -> Option<(i64, Value)> {
     ))
 }
 
-fn store(path: &Path, data: &Value, now: i64) -> io::Result<()> {
+fn store(service: ServiceId, path: &Path, data: &mut Value, now: i64) -> io::Result<()> {
+    let previous = read(path);
+    // Claude can omit windows after a model switch; keep their last reported numbers.
+    if service == ServiceId::ClaudeCode
+        && let Some((_, stored)) = &previous
+        && let (Some(current), Some(stored)) = (data.as_object_mut(), stored.as_object())
+    {
+        for (key, entry) in stored {
+            current.entry(key).or_insert_with(|| entry.clone());
+        }
+    }
     // Status lines run often; rewrite only when the numbers change or a minute has passed.
-    if let Some((received_at, stored)) = read(path)
+    if let Some((received_at, stored)) = previous
         && stored == *data
         && (0..60).contains(&(now - received_at))
     {
@@ -500,16 +514,59 @@ mod tests {
     fn received_numbers_are_rewritten_only_when_they_change_or_age() {
         let directory = temporary("store");
         let path = directory.join("received").join("claude.json");
-        let first = json!({"five_hour": {"used_percentage": 10}});
-        store(&path, &first, 1_000).unwrap();
+        let mut first = json!({"five_hour": {"used_percentage": 10}});
+        store(ServiceId::ClaudeCode, &path, &mut first, 1_000).unwrap();
         assert_eq!(read(&path), Some((1_000, first.clone())));
-        store(&path, &first, 1_030).unwrap();
+        store(ServiceId::ClaudeCode, &path, &mut first, 1_030).unwrap();
         assert_eq!(read(&path).unwrap().0, 1_000);
-        store(&path, &first, 1_061).unwrap();
+        store(ServiceId::ClaudeCode, &path, &mut first, 1_061).unwrap();
         assert_eq!(read(&path).unwrap().0, 1_061);
-        let second = json!({"five_hour": {"used_percentage": 11}});
-        store(&path, &second, 1_062).unwrap();
+        let mut second = json!({"five_hour": {"used_percentage": 11}});
+        store(ServiceId::ClaudeCode, &path, &mut second, 1_062).unwrap();
         assert_eq!(read(&path), Some((1_062, second)));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn switching_models_keeps_the_last_known_claude_windows_on_disk() {
+        let directory = temporary("model-switch");
+        let path = directory.join("claude.json");
+        let mut first = claude::extract(&json!({"rate_limits": {
+            "five_hour": {"used_percentage": 10, "resets_at": 20_000},
+            "seven_day": {"used_percentage": 30, "resets_at": 600_000},
+            "seven_day_overage_included": {"used_percentage": 40, "resets_at": 600_000}
+        }}))
+        .unwrap();
+        store(ServiceId::ClaudeCode, &path, &mut first, 1_000).unwrap();
+
+        let mut other_model = claude::extract(&json!({"rate_limits": {
+            "five_hour": {"used_percentage": 12, "resets_at": 20_000},
+            "seven_day": {"used_percentage": 32, "resets_at": 600_000}
+        }}))
+        .unwrap();
+        store(ServiceId::ClaudeCode, &path, &mut other_model, 1_600).unwrap();
+        let (_, stored) = read(&path).unwrap();
+        assert_eq!(
+            summary(ServiceId::ClaudeCode, Some(&stored)),
+            "残り 5時間 88%・週次 68%・Fable・週次 60%"
+        );
+        assert_eq!(stored, other_model);
+
+        let mut fable = claude::extract(&json!({"rate_limits": {
+            "five_hour": null,
+            "seven_day": {"used_percentage": null},
+            "seven_day_overage_included": {"used_percentage": 0, "resets_at": 1_200_000}
+        }}))
+        .unwrap();
+        store(ServiceId::ClaudeCode, &path, &mut fable, 600_001).unwrap();
+        let (received_at, stored) = read(&path).unwrap();
+        assert_eq!(received_at, 600_001);
+        assert_eq!(
+            summary(ServiceId::ClaudeCode, Some(&stored)),
+            "残り 5時間 88%・週次 68%・Fable・週次 100%"
+        );
+        assert_eq!(stored["five_hour"]["resets_at"], 20_000);
+        assert_eq!(stored["seven_day_overage_included"]["resets_at"], 1_200_000);
         fs::remove_dir_all(directory).unwrap();
     }
 

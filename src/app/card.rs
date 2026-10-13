@@ -77,7 +77,7 @@ pub(super) fn hero(snapshot: Option<&Snapshot>, source: &Source, now: i64) -> He
 
 fn window_hero(group: &Group, window: &Window, source: &Source, now: i64) -> Hero {
     let expired = window.expired(now);
-    let value = if expired {
+    let value = if expired && !source.received {
         "—".into()
     } else {
         window.remaining_label()
@@ -87,12 +87,12 @@ fn window_hero(group: &Group, window: &Window, source: &Source, now: i64) -> Her
         short_value: value.clone(),
         value,
         wait: None,
-        fraction: fraction(window.remaining).filter(|_| !expired),
+        fraction: fraction(window.remaining).filter(|_| !expired || source.received),
         blocked: false,
         detail: None,
         caption: "リセット",
         when: if expired && source.received {
-            "リセット済み".into()
+            "リセット済み・前回の値".into()
         } else if expired {
             "確認中…".into()
         } else {
@@ -249,13 +249,17 @@ fn window_line(group: &Group, window: &Window, received: bool, now: i64) -> Line
     let expired = window.expired(now);
     Line {
         title,
-        value: match (expired, received) {
-            (true, true) => "リセット済み".into(),
-            (true, false) => "確認中…".into(),
-            (false, _) => window.remaining_label(),
+        value: if expired && !received {
+            "確認中…".into()
+        } else {
+            window.remaining_label()
         },
-        fraction: fraction(window.remaining).filter(|_| !expired),
-        note: window.resets_at.map(reset_label),
+        fraction: fraction(window.remaining).filter(|_| !expired || received),
+        note: if expired && received {
+            Some("リセット済み・前回の値".into())
+        } else {
+            window.resets_at.map(reset_label)
+        },
         alert: false,
     }
 }
@@ -527,10 +531,18 @@ mod tests {
             None,
         );
         assert_eq!(hero(Some(&expired), &CODEX, NOW).when, "確認中…");
-        assert_eq!(hero(Some(&expired), &CLAUDE, NOW).when, "リセット済み");
+        let last_known = hero(Some(&expired), &CLAUDE, NOW);
+        assert_eq!(last_known.value, "40%");
+        assert_eq!(last_known.short_value, "40%");
+        assert_eq!(last_known.fraction, Some(0.4));
+        assert_eq!(last_known.when, "リセット済み・前回の値");
         assert_eq!(lines(&expired, false, NOW)[0].value, "確認中…");
-        assert_eq!(lines(&expired, true, NOW)[0].value, "リセット済み");
-        assert_eq!(blocks(&expired, &CLAUDE, NOW)[0].value, "—");
+        let last_line = &lines(&expired, true, NOW)[0];
+        assert_eq!(last_line.value, "10%");
+        assert_eq!(last_line.fraction, Some(0.1));
+        assert_eq!(last_line.note.as_deref(), Some("リセット済み・前回の値"));
+        assert_eq!(blocks(&expired, &CLAUDE, NOW)[0].value, "10%");
+        assert_eq!(hero(Some(&expired), &CLAUDE, NOW + 600).value, "40%");
         assert_eq!(hero(None, &CLAUDE, NOW).when, "まだデータがありません");
         assert_eq!(hero(None, &CODEX, NOW).when, "確認中…");
         let unknown = snapshot(vec![Group::default()], None);

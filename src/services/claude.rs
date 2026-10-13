@@ -31,6 +31,7 @@ pub fn extract(payload: &Value) -> Option<Value> {
     let kept: Map<String, Value> = limits
         .iter()
         .filter_map(|(key, entry)| {
+            used_percentage(entry)?;
             let entry: Map<String, Value> = entry
                 .as_object()?
                 .iter()
@@ -40,7 +41,7 @@ pub fn extract(payload: &Value) -> Option<Value> {
             (!entry.is_empty()).then(|| (key.clone(), Value::Object(entry)))
         })
         .collect();
-    Some(Value::Object(kept))
+    (!kept.is_empty()).then_some(Value::Object(kept))
 }
 
 pub fn snapshot(data: &Value, received_at: DateTime<Local>, now: i64) -> Snapshot {
@@ -64,7 +65,11 @@ pub fn snapshot(data: &Value, received_at: DateTime<Local>, now: i64) -> Snapsho
                 let name = ["model", "display_name"]
                     .into_iter()
                     .find_map(|field| entry.get(field).and_then(Value::as_str))
-                    .map_or_else(|| key.clone(), String::from);
+                    .unwrap_or(match key.as_str() {
+                        "seven_day_overage_included" => "Fable",
+                        _ => key,
+                    })
+                    .to_owned();
                 others.extend(
                     window(entry, minutes).map(|window| Group::new(Some(name), vec![window])),
                 );
@@ -163,6 +168,8 @@ mod tests {
             "rate_limits": {
                 "five_hour": {"used_percentage": 23.5, "resets_at": 1738425600, "note": "x"},
                 "seven_day": {"used_percentage": 41.2, "resets_at": 1738857600},
+                "seven_day_overage_included": {"used_percentage": null, "resets_at": 1738857600},
+                "five_hour_model": {"used_percentage": -1},
                 "empty": {"unknown": 1},
                 "broken": 3
             }
@@ -175,6 +182,11 @@ mod tests {
             })
         );
         assert!(extract(&json!({"model": {"display_name": "Opus"}})).is_none());
+        assert!(extract(&json!({"rate_limits": {}})).is_none());
+        assert!(extract(&json!({"rate_limits": {"five_hour": null}})).is_none());
+        assert!(
+            extract(&json!({"rate_limits": {"five_hour": {"resets_at": NOW + 3600}}})).is_none()
+        );
     }
 
     #[test]
@@ -183,7 +195,7 @@ mod tests {
             &json!({
                 "five_hour": {"used_percentage": 23.5, "resets_at": NOW + 3600},
                 "seven_day": {"used_percentage": 41.2, "resets_at": "2025-02-06T16:00:00Z"},
-                "seven_day_model": {"model": "Fable", "used_percentage": 42, "resets_at": NOW + 7200}
+                "seven_day_overage_included": {"used_percentage": 42, "resets_at": NOW + 7200}
             }),
             Local::now(),
             NOW,

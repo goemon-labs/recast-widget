@@ -2863,7 +2863,7 @@ SOFTWARE.
 ## MIT License
 
 対象：
-- [recast-widget 0.2.0 ソースコード](https://github.com/goemon-labs/recast-widget)
+- [recast-widget 0.2.2 ソースコード](https://github.com/goemon-labs/recast-widget)
 
 ```text
 MIT License
