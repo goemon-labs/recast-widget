@@ -903,12 +903,17 @@ impl Widget {
         let now = Local::now().timestamp();
         let source = self.source(service);
         let snapshot = self.snapshot(service);
-        // Model families with their own limits, such as Gemini and Claude・GPT, get equal size.
+        // Claude's time windows and separate model families use the same blocks as the list.
         let (blocks, lines) = match snapshot {
-            Some(usage) if card::has_families(usage) => (
-                card::blocks(usage, &source, now),
-                card::money_lines(usage, true),
-            ),
+            Some(usage)
+                if (service == ServiceId::ClaudeCode && usage.main_window().is_some())
+                    || card::has_families(usage) =>
+            {
+                (
+                    card::blocks(usage, &source, now),
+                    card::money_lines(usage, true),
+                )
+            }
             _ => (
                 vec![card::hero(snapshot, &source, now)],
                 snapshot.map_or_else(Vec::new, |usage| card::lines(usage, source.received, now)),
@@ -1932,16 +1937,12 @@ mod tests {
             Snapshot {
                 groups: vec![Group::new(
                     None,
-                    vec![window(300, 0.0, until), window(10080, 54.0, now + 86_400)],
+                    vec![window(300, 71.0, until), window(10080, 54.0, now + 86_400)],
                 )],
                 cap: None,
                 balance: None,
                 reset_credits: None,
-                blocked: Some(Blocked {
-                    label: "5時間".into(),
-                    until: Some(until),
-                    minutes: Some(300),
-                }),
+                blocked: None,
                 observed_at: Local::now(),
             },
         );
@@ -2000,7 +2001,7 @@ mod tests {
             "5時間の残り",
             "週次の残り",
             "62%",
-            "5時間の上限に達しました",
+            "71%",
         ] {
             assert!(has(&combined, wanted), "{wanted}");
         }
@@ -2020,8 +2021,29 @@ mod tests {
         assert_eq!(widget.detail, Some(ServiceId::ClaudeCode));
         texts(&mut widget);
         let detail = texts(&mut widget);
+        for wanted in ["5時間の残り", "71%", "週次の残り", "54%"] {
+            assert!(has(&detail, wanted), "{wanted}");
+        }
+        // Both limits keep their own full-size block and reset time in the detail view.
+        assert_eq!(
+            detail.iter().filter(|(text, _)| text == "リセット").count(),
+            2
+        );
+        let claude = widget.received.get_mut(&ServiceId::ClaudeCode).unwrap();
+        claude.groups[0].windows[0].remaining = Some(0.0);
+        claude.blocked = Some(Blocked {
+            label: "5時間".into(),
+            until: Some(until),
+            minutes: Some(300),
+        });
+        texts(&mut widget);
+        let detail = texts(&mut widget);
         assert!(has(&detail, "5時間の上限に達しました"));
         assert!(has(&detail, "週次の残り"));
+        assert_eq!(
+            detail.iter().filter(|(text, _)| text == "リセット").count(),
+            2
+        );
         click(&mut widget, egui::pos2(28.0, 33.0));
         assert_eq!(widget.detail, None);
         widget.settings.bar_mode = true;
