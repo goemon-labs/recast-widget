@@ -793,6 +793,8 @@ impl Widget {
                 ui.label(RichText::new(&error.message).size(11.0).color(MUTED));
             } else if service.received() && !self.settings.bridges.contains_key(&service) {
                 ui.label(RichText::new("接続していません").size(12.0).color(MUTED));
+            } else if let Some(hint) = self.initial_usage_hint(service) {
+                ui.label(RichText::new(hint).size(11.0).color(MUTED));
             }
         }
         let used_height = ui.cursor().top() - ui.min_rect().top();
@@ -911,7 +913,7 @@ impl Widget {
             {
                 (
                     card::blocks(usage, &source, now),
-                    card::money_lines(usage, true),
+                    card::money_lines(usage, true, source.received, now),
                 )
             }
             _ => (
@@ -954,6 +956,9 @@ impl Widget {
             if ui.small_button("設定を開く").clicked() {
                 self.settings_open = true;
             }
+        } else if let Some(hint) = self.initial_usage_hint(service) {
+            ui.add_space(15.0);
+            ui.label(RichText::new(hint).size(11.0).color(MUTED));
         }
 
         // Keep the footer in the content flow so expanded details cannot overlap it.
@@ -1242,11 +1247,22 @@ impl Widget {
         if service == ServiceId::Codex {
             return self.codex_status();
         }
-        if self.settings.bridges.contains_key(&service) {
-            "接続中".into()
-        } else {
+        if !self.settings.bridges.contains_key(&service) {
             "接続していません".into()
+        } else if self.received.contains_key(&service) {
+            "受信済み・使用中に更新".into()
+        } else if let Some(hint) = self.initial_usage_hint(service) {
+            format!("使用量の受信待ち\n{hint}")
+        } else {
+            "使用量の受信待ち".into()
         }
+    }
+
+    fn initial_usage_hint(&self, service: ServiceId) -> Option<&'static str> {
+        (service == ServiceId::AntigravityCli
+            && self.settings.bridges.contains_key(&service)
+            && !self.received.contains_key(&service))
+        .then_some("CLIを開き直して使ってください")
     }
 
     fn codex_status(&self) -> String {
@@ -1358,7 +1374,7 @@ impl Widget {
         }
         let record = bridge::link(service, None)?;
         self.settings.bridges.insert(service, record);
-        self.flash(format!("{}と接続しました", service.name()));
+        self.flash(format!("{}の連携設定を保存しました", service.name()));
         Ok(())
     }
 

@@ -1,6 +1,7 @@
 //! What one service's usage looks like, shared by the single card and the combined view.
 use super::{AMBER, BORDER, FOREGROUND, GREEN, MUTED, reset_label};
 use crate::quota::{self, Blocked, Cap, Group, Snapshot, Window};
+use chrono::{Local, TimeZone};
 use eframe::egui::{self, Align, Layout, RichText, Sense, vec2};
 
 /// How a service's numbers arrive, which changes how missing or stale data is described.
@@ -35,8 +36,7 @@ pub(super) struct Line {
     pub alert: bool,
 }
 
-/// A block still worth showing. Received numbers only refresh while the tool runs, so a block
-/// whose reset time has passed is left to the stale window display instead.
+/// A block still worth showing. Saved allowances recover at their reported reset time.
 fn active_block(snapshot: &Snapshot, received: bool, now: i64) -> Option<&Blocked> {
     snapshot
         .blocked
@@ -53,7 +53,7 @@ pub(super) fn hero(snapshot: Option<&Snapshot>, source: &Source, now: i64) -> He
             return window_hero(&snapshot.groups[0], window, source, now);
         }
         if let Some(cap) = &snapshot.cap {
-            return cap_hero(cap);
+            return cap_hero(cap, source.received, now);
         }
     }
     Hero {
@@ -68,7 +68,7 @@ pub(super) fn hero(snapshot: Option<&Snapshot>, source: &Source, now: i64) -> He
         when: if snapshot.is_some() {
             "残量を確認できませんでした".into()
         } else if source.received {
-            "まだデータがありません".into()
+            "使用量の受信待ち".into()
         } else {
             "確認中…".into()
         },
@@ -76,43 +76,41 @@ pub(super) fn hero(snapshot: Option<&Snapshot>, source: &Source, now: i64) -> He
 }
 
 fn window_hero(group: &Group, window: &Window, source: &Source, now: i64) -> Hero {
-    let expired = window.expired(now);
-    let value = if expired && !source.received {
-        "—".into()
-    } else {
-        window.remaining_label()
-    };
+    let remaining = displayed_remaining(window.remaining, window.resets_at, source.received, now);
+    let value = quota::percent_label(remaining);
     Hero {
         label: format!("{}の残り", group.window_label(window)),
         short_value: value.clone(),
         value,
         wait: None,
-        fraction: fraction(window.remaining).filter(|_| !expired || source.received),
+        fraction: fraction(remaining),
         blocked: false,
         detail: None,
         caption: "リセット",
-        when: if expired && source.received {
-            "リセット済み・前回の値".into()
-        } else if expired {
-            "確認中…".into()
-        } else {
-            window.resets_at.map_or("不明".into(), reset_label)
-        },
+        when: window.resets_at.map_or("不明".into(), |reset| {
+            reset_note(reset, source.received, now)
+        }),
     }
 }
 
-fn cap_hero(cap: &Cap) -> Hero {
-    let value = quota::percent_label(cap.remaining);
+fn cap_hero(cap: &Cap, received: bool, now: i64) -> Hero {
+    let remaining = displayed_remaining(cap.remaining, cap.resets_at, received, now);
+    let value = quota::percent_label(remaining);
     Hero {
         label: format!("{}の残り", cap.label),
         short_value: value.clone(),
         value,
         wait: None,
-        fraction: fraction(cap.remaining),
+        fraction: fraction(remaining),
         blocked: false,
-        detail: cap.detail.clone(),
+        detail: cap
+            .detail
+            .clone()
+            .filter(|_| cap.resets_at.is_none_or(|reset| reset > now)),
         caption: "リセット",
-        when: cap.resets_at.map_or("不明".into(), reset_label),
+        when: cap
+            .resets_at
+            .map_or("不明".into(), |reset| reset_note(reset, received, now)),
     }
 }
 
@@ -165,7 +163,7 @@ pub(super) fn blocks(snapshot: &Snapshot, source: &Source, now: i64) -> Vec<Hero
     if blocks.is_empty()
         && let Some(cap) = &snapshot.cap
     {
-        blocks.push(cap_hero(cap));
+        blocks.push(cap_hero(cap, source.received, now));
     }
     // A stop that no window explains, such as a spending cap, comes first.
     if let Some(blocked) = active_block(snapshot, source.received, now)
@@ -208,18 +206,29 @@ pub(super) fn lines(snapshot: &Snapshot, received: bool, now: i64) -> Vec<Line> 
         .map(|(group, window)| window_line(group, window, received, now))
         .collect();
     let cap_is_hero = block.is_none() && snapshot.main_window().is_none();
-    lines.extend(money_lines(snapshot, !cap_is_hero));
+    lines.extend(money_lines(snapshot, !cap_is_hero, received, now));
     lines
 }
 
 /// The spending cap, unless it is already the large figure, and the prepaid balance.
-pub(super) fn money_lines(snapshot: &Snapshot, with_cap: bool) -> Vec<Line> {
-    let cap = snapshot.cap.as_ref().filter(|_| with_cap).map(|cap| Line {
-        title: format!("{}の残り", cap.label),
-        value: quota::percent_label(cap.remaining),
-        fraction: fraction(cap.remaining),
-        note: cap.detail.clone(),
-        alert: cap.remaining.is_some_and(|remaining| remaining <= 0.0),
+pub(super) fn money_lines(
+    snapshot: &Snapshot,
+    with_cap: bool,
+    received: bool,
+    now: i64,
+) -> Vec<Line> {
+    let cap = snapshot.cap.as_ref().filter(|_| with_cap).map(|cap| {
+        let remaining = displayed_remaining(cap.remaining, cap.resets_at, received, now);
+        Line {
+            title: format!("{}の残り", cap.label),
+            value: quota::percent_label(remaining),
+            fraction: fraction(remaining),
+            note: match cap.resets_at.filter(|reset| *reset <= now) {
+                Some(reset) => Some(reset_note(reset, received, now)),
+                None => cap.detail.clone(),
+            },
+            alert: remaining.is_some_and(|remaining| remaining <= 0.0),
+        }
     });
     let balance = snapshot.balance.as_ref().map(|balance| Line {
         title: "クレジット残高".into(),
@@ -247,21 +256,48 @@ fn window_line(group: &Group, window: &Window, received: bool, now: i64) -> Line
         };
     }
     let expired = window.expired(now);
+    let remaining = displayed_remaining(window.remaining, window.resets_at, received, now);
     Line {
         title,
         value: if expired && !received {
             "確認中…".into()
         } else {
-            window.remaining_label()
+            quota::percent_label(remaining)
         },
-        fraction: fraction(window.remaining).filter(|_| !expired || received),
-        note: if expired && received {
-            Some("リセット済み・前回の値".into())
-        } else {
-            window.resets_at.map(reset_label)
-        },
+        fraction: fraction(remaining),
+        note: window
+            .resets_at
+            .map(|reset| reset_note(reset, received, now)),
         alert: false,
     }
+}
+
+/// Apply a saved reset time for tools that only report usage while they run.
+fn displayed_remaining(
+    remaining: Option<f64>,
+    resets_at: Option<i64>,
+    received: bool,
+    now: i64,
+) -> Option<f64> {
+    if resets_at.is_some_and(|reset| reset <= now) {
+        received.then_some(100.0)
+    } else {
+        remaining
+    }
+}
+
+fn reset_note(reset: i64, received: bool, now: i64) -> String {
+    if reset > now {
+        return reset_label(reset);
+    }
+    if !received {
+        return "確認中…".into();
+    }
+    let time = Local
+        .timestamp_opt(reset, 0)
+        .single()
+        .map_or("不明".into(), |date| date.format("%H:%M").to_string());
+    format!("リセット済 / {time}")
 }
 
 fn fraction(percent: Option<f64>) -> Option<f32> {
@@ -459,6 +495,11 @@ mod tests {
         let later = super::hero(Some(&usage), &CLAUDE, until + 1);
         assert!(!later.blocked);
         assert_eq!(later.label, "週次の残り");
+        let reset = super::blocks(&usage, &CLAUDE, until);
+        assert_eq!(reset[0].value, "100%");
+        assert_eq!(reset[0].fraction, Some(1.0));
+        assert!(!reset[0].blocked);
+        assert_eq!(reset[1].value, "54%");
         // Fetched numbers wait for the next fetch to confirm the reset.
         let pending = super::hero(Some(&usage), &CODEX, until + 1);
         assert!(pending.blocked);
@@ -532,24 +573,93 @@ mod tests {
         );
         assert_eq!(hero(Some(&expired), &CODEX, NOW).when, "確認中…");
         let last_known = hero(Some(&expired), &CLAUDE, NOW);
-        assert_eq!(last_known.value, "40%");
-        assert_eq!(last_known.short_value, "40%");
-        assert_eq!(last_known.fraction, Some(0.4));
-        assert_eq!(last_known.when, "リセット済み・前回の値");
+        assert_eq!(last_known.value, "100%");
+        assert_eq!(last_known.short_value, "100%");
+        assert_eq!(last_known.fraction, Some(1.0));
+        assert_eq!(last_known.when, reset_note(NOW - 1, true, NOW));
         assert_eq!(lines(&expired, false, NOW)[0].value, "確認中…");
         let last_line = &lines(&expired, true, NOW)[0];
-        assert_eq!(last_line.value, "10%");
-        assert_eq!(last_line.fraction, Some(0.1));
-        assert_eq!(last_line.note.as_deref(), Some("リセット済み・前回の値"));
-        assert_eq!(blocks(&expired, &CLAUDE, NOW)[0].value, "10%");
-        assert_eq!(hero(Some(&expired), &CLAUDE, NOW + 600).value, "40%");
-        assert_eq!(hero(None, &CLAUDE, NOW).when, "まだデータがありません");
+        assert_eq!(last_line.value, "100%");
+        assert_eq!(last_line.fraction, Some(1.0));
+        assert_eq!(last_line.note, Some(reset_note(NOW - 1, true, NOW)));
+        assert_eq!(blocks(&expired, &CLAUDE, NOW)[0].value, "100%");
+        assert_eq!(hero(Some(&expired), &CLAUDE, NOW + 600).value, "100%");
+        assert_eq!(hero(None, &CLAUDE, NOW).when, "使用量の受信待ち");
         assert_eq!(hero(None, &CODEX, NOW).when, "確認中…");
         let unknown = snapshot(vec![Group::default()], None);
         assert_eq!(
             hero(Some(&unknown), &CODEX, NOW).when,
             "残量を確認できませんでした"
         );
+    }
+
+    #[test]
+    fn saved_windows_reset_independently_and_new_reports_replace_the_display() {
+        use crate::services::claude;
+        use serde_json::json;
+
+        let reset = Local.with_ymd_and_hms(2026, 1, 13, 14, 34, 0).unwrap();
+        let now = reset.timestamp();
+        let mut data = json!({
+            "five_hour": {"used_percentage": 90, "resets_at": now},
+            "seven_day": {"used_percentage": 60, "resets_at": now + 3600}
+        });
+        let saved = claude::snapshot(&data, reset, now - 1);
+        assert_eq!(lines(&saved, true, now - 1)[0].value, "10%");
+        // Reopening after the reset and keeping the app open give the same result.
+        let reopened = claude::snapshot(&data, reset, now);
+        assert_eq!(
+            blocks(&saved, &CLAUDE, now),
+            blocks(&reopened, &CLAUDE, now)
+        );
+        let current = lines(&reopened, true, now);
+        assert_eq!(current[0].value, "100%");
+        assert_eq!(current[0].note.as_deref(), Some("リセット済 / 14:34"));
+        assert_eq!(hero(Some(&reopened), &CLAUDE, now).value, "40%");
+
+        let weekly = hero(Some(&reopened), &CLAUDE, now + 3600);
+        assert_eq!(weekly.value, "100%");
+        assert_eq!(weekly.when, "リセット済 / 15:34");
+        assert_eq!(bar_text(&weekly), "週次の残り 100%");
+
+        data["five_hour"] = json!({"used_percentage": 5, "resets_at": now + 18_000});
+        let refreshed = claude::snapshot(&data, reset, now + 60);
+        let updated = lines(&refreshed, true, now + 60);
+        assert_eq!(updated[0].value, "95%");
+        assert_eq!(updated[0].note, Some(reset_label(now + 18_000)));
+        assert_eq!(hero(Some(&refreshed), &CLAUDE, now + 60).value, "40%");
+    }
+
+    #[test]
+    fn saved_spending_caps_reset_without_showing_previous_period_spend() {
+        let reset = Local
+            .with_ymd_and_hms(2026, 1, 13, 14, 34, 0)
+            .unwrap()
+            .timestamp();
+        let mut usage = snapshot(
+            vec![Group::default()],
+            Some(Blocked {
+                label: "今月の利用額".into(),
+                until: Some(reset),
+                minutes: None,
+            }),
+        );
+        usage.cap = Some(Cap {
+            label: "今月の利用額の上限".into(),
+            remaining: Some(0.0),
+            detail: Some("$500 / $500 使用".into()),
+            resets_at: Some(reset),
+        });
+        assert!(hero(Some(&usage), &CLAUDE, reset - 1).blocked);
+        let restored = hero(Some(&usage), &CLAUDE, reset);
+        assert_eq!(restored.value, "100%");
+        assert_eq!(restored.when, "リセット済 / 14:34");
+        assert!(restored.detail.is_none());
+        assert!(!restored.blocked);
+        let cap = money_lines(&usage, true, true, reset).remove(0);
+        assert_eq!(cap.value, "100%");
+        assert_eq!(cap.note.as_deref(), Some("リセット済 / 14:34"));
+        assert!(!cap.alert);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use crate::{
     services::{self, ServiceId, antigravity, claude},
     settings::{self, Bridge, Settings},
 };
-use chrono::Local;
+use chrono::{DateTime, Local};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -50,7 +50,7 @@ pub fn run(key: &str) -> i32 {
         Some(command) => run_previous(&command, &input).unwrap_or_default(),
         // Antigravity CLI keeps its own line, which already shows the quota.
         None if service == ServiceId::AntigravityCli => Vec::new(),
-        None => summary(service, data.as_ref()).into_bytes(),
+        None => summary(service, data.as_ref(), Local::now()).into_bytes(),
     };
     let mut stdout = io::stdout().lock();
     let _ = stdout.write_all(&output);
@@ -100,10 +100,9 @@ fn store(service: ServiceId, path: &Path, data: &mut Value, now: i64) -> io::Res
     settings::write_atomic(path, &serde_json::to_vec(&record)?)
 }
 
-fn summary(service: ServiceId, data: Option<&Value>) -> String {
-    let now = Local::now().timestamp();
+fn summary(service: ServiceId, data: Option<&Value>, now: DateTime<Local>) -> String {
     let Some(snapshot) =
-        data.and_then(|data| services::received_snapshot(service, data, Local::now(), now))
+        data.and_then(|data| services::received_snapshot(service, data, now, now.timestamp()))
     else {
         return String::new();
     };
@@ -115,7 +114,11 @@ fn summary(service: ServiceId, data: Option<&Value>) -> String {
                 format!(
                     "{} {}",
                     group.window_label(window),
-                    window.remaining_label()
+                    if window.expired(now.timestamp()) {
+                        "100%".into()
+                    } else {
+                        window.remaining_label()
+                    }
                 )
             })
         })
@@ -426,6 +429,7 @@ fn shell_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     fn temporary(name: &str) -> PathBuf {
         let directory = std::env::temp_dir().join(format!(
@@ -547,7 +551,11 @@ mod tests {
         store(ServiceId::ClaudeCode, &path, &mut other_model, 1_600).unwrap();
         let (_, stored) = read(&path).unwrap();
         assert_eq!(
-            summary(ServiceId::ClaudeCode, Some(&stored)),
+            summary(
+                ServiceId::ClaudeCode,
+                Some(&stored),
+                Local.timestamp_opt(1_600, 0).unwrap()
+            ),
             "残り 5時間 88%・週次 68%・Fable・週次 60%"
         );
         assert_eq!(stored, other_model);
@@ -562,8 +570,12 @@ mod tests {
         let (received_at, stored) = read(&path).unwrap();
         assert_eq!(received_at, 600_001);
         assert_eq!(
-            summary(ServiceId::ClaudeCode, Some(&stored)),
-            "残り 5時間 88%・週次 68%・Fable・週次 100%"
+            summary(
+                ServiceId::ClaudeCode,
+                Some(&stored),
+                Local.timestamp_opt(600_001, 0).unwrap()
+            ),
+            "残り 5時間 100%・週次 100%・Fable・週次 100%"
         );
         assert_eq!(stored["five_hour"]["resets_at"], 20_000);
         assert_eq!(stored["seven_day_overage_included"]["resets_at"], 1_200_000);
@@ -577,10 +589,10 @@ mod tests {
             "seven_day": {"used_percentage": 68.4}
         });
         assert_eq!(
-            summary(ServiceId::ClaudeCode, Some(&data)),
+            summary(ServiceId::ClaudeCode, Some(&data), Local::now()),
             "残り 5時間 71%・週次 31%"
         );
-        assert_eq!(summary(ServiceId::ClaudeCode, None), "");
+        assert_eq!(summary(ServiceId::ClaudeCode, None, Local::now()), "");
         assert!(is_widget_command(
             "C:/app/widget.exe statusline claude",
             ServiceId::ClaudeCode
